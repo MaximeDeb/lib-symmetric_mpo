@@ -59,21 +59,6 @@ def apply_gate(
     B1 = mpo.TN[f"B{site1}"]
     B2 = mpo.TN[f"B{site2}"]
     
-    # PhiB = tensor_contract(B1, B2, ([3], [0]))
-    # # Swap to standard order
-    # PhiB = swap_indices(PhiB, [0, 1, 3, 2, 4, 5], [0, 1, 2, 3, 4, 5])
-    
-    # # Apply U from the left
-    # UPhiB = tensor_contract(U, PhiB, ([2, 3], [1, 2]))
-    # UPhiB = swap_indices(UPhiB, [2, 0, 1, 3, 4, 5], [0, 1, 2, 3, 4, 5])
-    
-    # if both_sides:
-    #     # Apply U_dag from the right
-    #     UPhiBU = tensor_contract(UPhiB, U_dag, ([3, 4], [2, 3]))
-    #     UPhiBU = swap_indices(UPhiBU, [0, 1, 2, 4, 5, 3], [0, 1, 2, 3, 4, 5])
-    # else:
-    #     UPhiBU = UPhiB
-    
     if not both_sides and side == "R":
         ind = [3, 4]
         tr = [2, 3, 0, 4, 1, 5]
@@ -89,9 +74,6 @@ def apply_gate(
     UPhiB = swap_indices(UPhiB, tr, [0, 1, 2, 3, 4, 5])
 
     if both_sides:
-        # UPhiB = tensor_contract(UPhiB, gate_dag, ([3, 4], [2, 3]))
-        # UPhiB = swap_indices(UPhiB, [0, 1, 2, 4, 5, 3], [0, 1, 2, 3, 4, 5])
-        
         UPhiB = tensor_contract(gate_dag, UPhiB, ([2, 3], [3, 4]))
         UPhiB = swap_indices(UPhiB, [2, 3, 4, 0, 1, 5], [0, 1, 2, 3, 4, 5])
 
@@ -128,14 +110,21 @@ def apply_lambda(
     n_legs = np.arange(A.n_legs)
     left_legs = np.zeros(1, dtype=np.intp)
     right_legs = np.setdiff1d(n_legs, 0)
-    
+
+    # Lambda is block-diagonal in the symmetry sector, so it acts on each
+    # tensor block independently: no need to assemble/split a big matrix.
     sectors = np.intersect1d(lam.right_sectors, A.leg_sectors[0])
-    n_sectors = len(sectors)
-    
-    A_blocks, A_shapes = so.reshape_data_tensors(A, left_legs, right_legs)
-    
-    coord_sectors = A.coordinates[0, None, :] == sectors[:, None]
-    
+    covered = np.isin(A.coordinates[0, :], sectors)
+
+    # Blocks whose left sector carries no singular values are multiplied
+    # by zero; drop them instead of silently corrupting them (old code
+    # left them uninitialized and scattered stale entries into slot 0).
+    if not np.all(covered):
+        A = mask_coordinates(A.copy(copy_data=False), covered)
+
+    A_blocks, _ = so.reshape_data_tensors(A, left_legs, right_legs,
+                                          return_shapes=False)
+
     B = SymmetricTensor(
         A.L, A.d, A.phys_dims,
         alpha=A.alpha,
@@ -145,60 +134,20 @@ def apply_lambda(
     )
     B.arrows = A.arrows.copy()
     B.leg_type = A.leg_type.copy()
-    
-    if not A.data_as_tensors:
-        B.coordinates = A.coordinates.copy()
-        B.shapes = A.shapes.copy()
-    
-    input_indices = np.arange(A.n_sectors)
-    output_indices = np.zeros(A.n_sectors, dtype=np.intp)
-    
-    n_coord = 0
-    for s in range(n_sectors):
-        sector_mask = coord_sectors[s]
-        n_blocks = np.sum(sector_mask)
-        shapes_sect = A_shapes[:, sector_mask]
-        
-        if A.data_as_tensors:
-            new_coords = np.concatenate([
-                np.tile(lam.left_sectors[s], (1, n_blocks)),
-                A.coordinates[right_legs][:, sector_mask]
-            ], axis=0)
-            B.coordinates[:, n_coord:n_coord + n_blocks] = new_coords
-            B.shapes[:, n_coord:n_coord + n_blocks] = A.shapes[:, sector_mask]
-        
-        output_indices[n_coord:n_coord + n_blocks] = input_indices[sector_mask]
-        
-        # Apply Lambda
-        mat_A = np.concatenate(A_blocks[sector_mask], axis=1)
-        mat_B = np.diag(lam.data[sectors[s]]) @ mat_A
-        
-        cuts = np.cumsum(shapes_sect[1, :-1])
-        split_B = np.array_split(mat_B, cuts, axis=1)
-        
-        if A.data_as_tensors:
-            B.data[n_coord:n_coord + n_blocks] = [
-                split_B[i].astype(complex).reshape(B.shapes[:, n_coord + i])
-                for i in range(n_blocks)
-            ]
-        else:
-            B.data[n_coord:n_coord + n_blocks] = [
-                split_B[i].astype(complex) for i in range(n_blocks)
-            ]
-        
-        n_coord += n_blocks
-    
-    B.leg_sectors = np.array([
-        np.unique(B.coordinates[i, :])
-        for i in range(B.n_legs)
-    ], dtype=object)
-    
-    # Restore original ordering
+    B.coordinates = A.coordinates.copy()
+    B.shapes = A.shapes.copy()
+
+    lam_data = lam.data
     if A.data_as_tensors:
-        B.coordinates[:, output_indices] = B.coordinates[:, input_indices].copy()
-        B.shapes[:, output_indices] = B.shapes[:, input_indices].copy()
-    B.data[output_indices] = B.data[input_indices].copy()
-    
+        for i in range(A.n_sectors):
+            vec = lam_data[A.coordinates[0, i]]
+            res = vec[:, None] * A_blocks[i]
+            B.data[i] = np.asarray(res, dtype=complex).reshape(B.shapes[:, i])
+    else:
+        for i in range(A.n_sectors):
+            vec = lam_data[A.coordinates[0, i]]
+            B.data[i] = np.asarray(vec[:, None] * A_blocks[i], dtype=complex)
+
     return B
 
 
@@ -375,11 +324,11 @@ def _symmetric_canonicalize(
                 rsh2 = B2.shapes[virtual_B2, idx_B2:idx_B2 + n_R[s]]
             
             B1.data[idx_B1:idx_B1 + n_L[s]] = [
-                split_B1[i].astype(complex).reshape(rsh1[:, i])
+                split_B1[i].astype(complex, copy=False).reshape(rsh1[:, i])
                 for i in range(n_L[s])
             ]
             B2.data[idx_B2:idx_B2 + n_R[s]] = [
-                split_Vh[i].astype(complex).reshape(rsh2[:, i])
+                split_Vh[i].astype(complex, copy=False).reshape(rsh2[:, i])
                 for i in range(n_R[s])
             ]
         
@@ -451,9 +400,13 @@ def _truncate(
                         mask_keep = S_trunc[s] > threshold
                         S[s] = np.concatenate([S_keep[s], S_trunc[s][mask_keep]])
                         
+                        # A sector may hold fewer than chi_block values:
+                        # np.arange(chi_block) would then index Vh out of
+                        # bounds. Offset by the actual number kept.
+                        n_keep = len(S_keep[s])
                         idx_keep = np.concatenate([
-                            np.arange(chi_block),
-                            chi_block + np.where(mask_keep)[0]
+                            np.arange(n_keep),
+                            n_keep + np.where(mask_keep)[0]
                         ])
                         Vh[s] = Vh[s][idx_keep.astype(int), :]
                     
@@ -465,7 +418,9 @@ def _truncate(
                     discarded += np.sum(S[s][chi_max:] ** 2)
                     S[s] = S[s][:chi_max]
                     Vh[s] = Vh[s][:chi_max, :]
-            truncated = True
+                    # Flag only if something was actually cut, so that the
+                    # sector-consistency sweep is not triggered needlessly.
+                    truncated = True
     
     return S, Vh, truncated, discarded
 

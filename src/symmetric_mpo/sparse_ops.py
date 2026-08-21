@@ -43,7 +43,8 @@ def block_split(
 def reshape_data_tensors(
     tensor: Any, 
     left_legs: NDArray[np.intp], 
-    right_legs: NDArray[np.intp]
+    right_legs: NDArray[np.intp],
+    return_shapes: bool = True
 ) -> tuple[NDArray, NDArray]:
     """
     Reshape tensor data blocks as matrices for contraction.
@@ -71,13 +72,23 @@ def reshape_data_tensors(
     matrices = np.empty(tensor.n_sectors, dtype=object)
     
     if tensor.data_as_tensors:
-        # Each tensor block is reshaped as a matrix
+        # Each tensor block is reshaped as a matrix. The permutation that
+        # brings the left legs to the front is the same for every block:
+        # compute it once (np.moveaxis re-normalizes axes on every call,
+        # which dominated the numeric phase at small chi).
         n_left = len(left_legs)
+        perm = tuple(int(p) for p in np.concatenate(
+            [left_legs, np.setdiff1d(n_legs, left_legs)]
+        ))
+        identity_perm = perm == tuple(range(tensor.n_legs))
+        right_dims = np.prod(tensor.shapes[right_legs, :], axis=0) \
+            if len(right_legs) > 0 else np.ones(tensor.n_sectors, dtype=np.intp)
         for i, data in enumerate(tensor.data):
-            # Move left legs to front, then reshape
-            reordered = np.moveaxis(data, left_legs, n_legs[:n_left])
-            right_dim = np.prod(tensor.shapes[right_legs, i])
-            matrices[i] = reordered.reshape(-1, right_dim)
+            if not identity_perm:
+                data = data.transpose(perm)
+            matrices[i] = data.reshape(-1, right_dims[i])
+        if not return_shapes:
+            return matrices, None
         shapes = np.array([matrices[i].shape for i in range(tensor.n_sectors)]).T
     else:
         # Data already stored as matrices
@@ -239,36 +250,35 @@ def construct_matrix_from_subblocks(
     block_shape_right : ndarray
         Column sizes of blocks.
     """
+    block_shape_left = mat_shapes[0, :, 0].copy()
+    block_shape_right = mat_shapes[1, 0, :].copy()
+
+    # Preallocate once instead of building rows of temporaries with
+    # np.zeros + np.concatenate (empty blocks are implicit zeros).
+    row_off = np.concatenate(([0], np.cumsum(block_shape_left)))
+    col_off = np.concatenate(([0], np.cumsum(block_shape_right)))
+    matrix = np.zeros((row_off[-1], col_off[-1]), dtype=complex)
+
+    blocks = block_matrices[sector_mask]
+
     block_list_left = []
-    rows = []
-    
     for i, row_coords in enumerate(block_coords):
-        row_blocks = []
         # Find first non-empty block in this row
         valid_blocks = row_coords[row_coords != -1]
         if len(valid_blocks) > 0:
             block_list_left.append(valid_blocks[0])
-        
         for j, block_idx in enumerate(row_coords):
             if block_idx != -1:
-                row_blocks.append(block_matrices[sector_mask][block_idx])
-            else:
-                # Empty block - fill with zeros
-                row_blocks.append(np.zeros(mat_shapes[:, i, j]))
-        rows.append(np.concatenate(row_blocks, axis=1))
-    
-    matrix = np.concatenate(rows, axis=0)
-    
+                matrix[row_off[i]:row_off[i + 1],
+                       col_off[j]:col_off[j + 1]] = blocks[block_idx]
+
     # Right block list
     block_list_right = []
     for col in block_coords.T:
         valid = col[col != -1]
         if len(valid) > 0:
             block_list_right.append(valid[0])
-    
-    block_shape_left = mat_shapes[0, :, 0].copy()
-    block_shape_right = mat_shapes[1, 0, :].copy()
-    
+
     return matrix, block_list_left, block_list_right, block_shape_left, block_shape_right
 
 

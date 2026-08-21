@@ -295,10 +295,25 @@ def get_gate_sequence(
         layer = step.layer
         dt = step.dt
         
-        if (layer, dt) in U:
-            gate = U[layer, dt]
-            gate_dag = U_dag[layer, dt]
-            site_pairs = gates.get(layer, [])
-            result.append((gate, gate_dag, site_pairs, step))
+        # Fail loudly: silently skipping a missing (layer, dt) key used
+        # to drop Trotter steps and evolve with the WRONG total time.
+        # (E.g. n_parts=1 with obs_interval >= 2 merges boundary steps
+        # into a 2*dt gate that was never precomputed.)
+        if (layer, dt) not in U:
+            raise KeyError(
+                f"get_gate_sequence: no precomputed gate for layer "
+                f"{layer!r} with dt={dt!r}. Available keys: "
+                f"{sorted(U.keys())}. Precompute this gate or adjust "
+                f"n_parts/obs_interval so merged steps match dt_list."
+            )
+        if (layer, dt) not in U_dag:
+            raise KeyError(
+                f"get_gate_sequence: no adjoint gate for layer "
+                f"{layer!r} with dt={dt!r}."
+            )
+        gate = U[layer, dt]
+        gate_dag = U_dag[layer, dt]
+        site_pairs = gates.get(layer, [])
+        result.append((gate, gate_dag, site_pairs, step))
     
     return result

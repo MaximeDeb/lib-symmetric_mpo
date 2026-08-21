@@ -179,6 +179,21 @@ class SymmetricGate:
         self.shapes = np.ones((4, 6), dtype=np.intp)
         
         # Non-zero blocks: (sigma1, sigma2, sigma1', sigma2')
+        #
+        # NOTE (convention / latent transpose ambiguity):
+        # With basis index b = 2*sigma1 + sigma2, the element assigned to
+        # coordinates (s1, s2, s1', s2') is U[2*s1+s2, 2*s1'+s2'] for the
+        # off-diagonal blocks below, i.e. rows are unprimed (output) and
+        # columns are primed (input): the gate acts as U |s1 s2><s1' s2'|.
+        # For dag=True the CONJUGATE is stored at the SAME coordinates
+        # with leg_type 'p', so together with the crossed contraction in
+        # apply_gate this represents U^dagger.
+        # All Hamiltonians currently implemented (Heis_nn, IRLM, Givens
+        # with real couplings) yield a SYMMETRIC U (U[1,2] == U[2,1]), so
+        # any accidental row/column swap would be invisible here. If a
+        # model with complex hopping (non-symmetric U) is added, verify
+        # this convention against a dense reference before trusting
+        # results.
         self.coordinates[:, 0] = [0, 0, 0, 0]
         self.coordinates[:, 1] = [0, 1, 0, 1]
         self.coordinates[:, 2] = [1, 0, 0, 1]
@@ -345,8 +360,17 @@ class SymmetricMPO:
                 chi_block=self.chi_block
             )
     
-    def copy(self) -> 'SymmetricMPO':
-        """Create a deep copy of the MPO."""
+    def copy(self, copy_data: bool = True) -> 'SymmetricMPO':
+        """
+        Create a copy of the MPO.
+
+        Parameters
+        ----------
+        copy_data : bool
+            If False, tensor data blocks are shared with the original
+            (metadata is still copied). Safe as long as blocks are only
+            replaced, never mutated in place -- the library convention.
+        """
         B = SymmetricMPO(
             self.L, self.d, self.q_alpha, self.phys_dims,
             chi_max=self.chi_max,
@@ -359,7 +383,7 @@ class SymmetricMPO:
         )
         
         for i in range(self.L):
-            B.TN[f"B{i}"] = self.TN[f"B{i}"].copy()
+            B.TN[f"B{i}"] = self.TN[f"B{i}"].copy(copy_data=copy_data)
             B.TN[f"Lam{i}"] = self.TN[f"Lam{i}"].copy()
         
         return B
@@ -468,40 +492,47 @@ class SymmetricMPO:
             pac = tensor_contract(pac, B, ([0], [0]))
             
             # Sum over sigma = sigma' (trace over physical)
-            mask = np.zeros(pac.n_sectors, dtype=bool)
-            for n in range(pac.n_sectors):
-                if pac.coordinates[0, n] == pac.coordinates[1, n]:
-                    mask[n] = True
+            mask = pac.coordinates[0, :] == pac.coordinates[1, :]
             
-            # Project to right virtual leg only
-            pac.coordinates = pac.coordinates[-1, mask].reshape(1, -1)
-            pac.data = pac.data[mask]
+            # Project to right virtual leg only. Each surviving block is a
+            # (1, 1, chi_r) tensor: keep the FULL chi_r vector. (The old
+            # code took .flat[0], silently discarding all but the first
+            # element -- wrong for any bond dimension > 1.)
+            right_coords = pac.coordinates[-1, mask]
+            right_shapes = pac.shapes[-1, mask]
+            blocks = pac.data[mask]
             
             # Combine equal sectors
             coords, idx, inv = np.unique(
-                pac.coordinates, return_index=True, return_inverse=True
+                right_coords, return_index=True, return_inverse=True
             )
-            pac.coordinates = coords.reshape(1, -1)
-            pac.leg_sectors = np.array([coords], dtype=object)
-            pac.shapes = pac.shapes[-1, mask].reshape(1, -1)[:, idx]
-            pac.arrows = np.array(['o'])
-            pac.leg_type = np.array(['v'])
-            pac.n_legs = 1
-            pac.n_sectors = len(coords)
             
-            # Sum contributions from same sector
-            new_data = np.empty(pac.n_sectors, dtype=object)
-            for a in range(pac.n_sectors):
+            new_data = np.empty(len(coords), dtype=object)
+            for a in range(len(coords)):
                 eq_sectors = np.where(inv == a)[0]
-                total = 0
-                for s in eq_sectors:
-                    total += pac.data[s].flat[0]
-                new_data[a] = np.array([total])
-            pac.data = new_data
+                acc = blocks[eq_sectors[0]].reshape(-1)
+                if len(eq_sectors) > 1:
+                    acc = acc.copy()
+                    for s in eq_sectors[1:]:
+                        acc += blocks[s].reshape(-1)
+                new_data[a] = acc
+            
+            new_pac = SymmetricTensor(
+                self.L, self.d, 0,
+                alpha=self.alpha,
+                n_legs=1, n_sectors=len(coords)
+            )
+            new_pac.coordinates = coords.reshape(1, -1)
+            new_pac.leg_sectors = np.array([coords], dtype=object)
+            new_pac.shapes = right_shapes[idx].reshape(1, -1)
+            new_pac.arrows = np.array(['o'])
+            new_pac.leg_type = np.array(['v'])
+            new_pac.data = new_data
+            pac = new_pac
         
         if len(pac.data) == 0:
             return 0.0
-        return pac.data[0][0]
+        return complex(sum(np.sum(d) for d in pac.data))
     
     def export(self, filename: str) -> None:
         """
@@ -513,11 +544,15 @@ class SymmetricMPO:
             Path to output file.
         """
         with h5py.File(filename, 'w') as f:
-            # Store scalar attributes
+            # Store scalar attributes. h5py cannot store None: encode
+            # chi_max=None (no truncation) as the sentinel -1.
             for attr in ['L', 'd', 'q_alpha', 'chi_max', 'chi_block', 
                         'alpha', 'phys_dims', 'th_sing_vals', 
                         'data_as_tensors', 'truncation_type']:
-                f.attrs[attr] = getattr(self, attr)
+                val = getattr(self, attr)
+                if attr == 'chi_max' and val is None:
+                    val = -1
+                f.attrs[attr] = val
             
             for i in range(self.L):
                 B = self.TN[f"B{i}"]
@@ -557,12 +592,14 @@ class SymmetricMPO:
         """
         with h5py.File(filename, 'r') as f:
             attrs = dict(f.attrs)
+            chi_max = attrs['chi_max']
+            chi_max = None if chi_max == -1 else int(chi_max)
             mpo = cls(
                 L=attrs['L'],
                 d=attrs['d'],
                 q_alpha=attrs['q_alpha'],
                 phys_dims=attrs['phys_dims'],
-                chi_max=attrs['chi_max'],
+                chi_max=chi_max,
                 chi_block=attrs['chi_block'],
                 th_sing_vals=attrs['th_sing_vals'],
                 alpha=attrs['alpha'],
@@ -823,7 +860,12 @@ def apply_fermionic_op(
     SymmetricMPO
         Modified MPO (copy).
     """
-    O = mpo.copy()
+    # Shallow copy: coordinates/metadata are copied (they get mutated
+    # below); data blocks are shared with the input (they are only ever
+    # replaced, never edited in place). This removes the two full deep
+    # copies per call that previously made compute_R_matrix O(L^2) in
+    # whole-MPO copies.
+    O = mpo.copy(copy_data=False)
     
     leg_nb = 2 if side == "L" else 1
     inc_st = 1 if ((op_type == "c" and side == "L") or 
@@ -840,10 +882,7 @@ def apply_fermionic_op(
         O.alpha * B.coordinates[1, :] + 
         B.coordinates[2, :]
     )
-    B.leg_sectors = np.array([
-        np.unique(B.coordinates[l, :])
-        for l in range(B.n_legs)
-    ], dtype=object)
+    B.invalidate_leg_sectors()
     
     # Propagate charge change to sites on the right
     for j in range(site + 1, O.L):
@@ -857,14 +896,11 @@ def apply_fermionic_op(
             O.alpha * Bj.coordinates[1, :] + 
             Bj.coordinates[2, :]
         )
-        Bj.leg_sectors = np.array([
-            np.unique(Bj.coordinates[l, :])
-            for l in range(Bj.n_legs)
-        ], dtype=object)
+        Bj.invalidate_leg_sectors()
     
-    # Jordan-Wigner string
+    # Jordan-Wigner string (in place: O is already our private copy)
     sign_sites = np.arange(site) if sign_side == "L" else np.arange(site + 1, O.L)
-    O = apply_spin_op("sz", O, sign_sites, side=side)
+    O = apply_spin_op("sz", O, sign_sites, side=side, inplace=True)
     
     return O
 
@@ -873,7 +909,8 @@ def apply_spin_op(
     op_type: Literal["sz"],
     mpo: SymmetricMPO,
     sites: int | list[int] | NDArray,
-    side: Literal["L", "R"] = "L"
+    side: Literal["L", "R"] = "L",
+    inplace: bool = False
 ) -> SymmetricMPO:
     """
     Apply a spin operator (Pauli Z) to specified sites.
@@ -888,13 +925,18 @@ def apply_spin_op(
         Sites to apply operator.
     side : {"L", "R"}
         Act from left or right.
+    inplace : bool
+        Modify `mpo` directly instead of returning a copy. Used
+        internally to avoid redundant full-MPO copies.
         
     Returns
     -------
     SymmetricMPO
-        Modified MPO (copy).
+        Modified MPO (copy unless inplace=True). The copy shares
+        unmodified data blocks with the input; sign flips create new
+        block arrays, so the input is never altered.
     """
-    O = mpo.copy()
+    O = mpo if inplace else mpo.copy(copy_data=False)
     leg_nb = 2 if side == "L" else 1
     
     if isinstance(sites, (int, np.integer)):

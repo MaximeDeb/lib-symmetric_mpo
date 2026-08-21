@@ -220,7 +220,33 @@ class SymmetricTensor:
         self.data = np.empty(n_sectors, dtype=object)
         self.shapes = np.ones((n_legs, n_sectors), dtype=np.intp)
         self.arrows = np.empty(n_legs, dtype='U1')
-        self.leg_sectors = np.empty(n_legs, dtype=object)
+        # leg_sectors is computed lazily from coordinates (see property below).
+        self._leg_sectors = None
+
+    @property
+    def leg_sectors(self) -> NDArray:
+        """
+        Available sector labels for each leg (lazy).
+
+        Recomputed from `coordinates` on demand whenever the cached value
+        has been invalidated (e.g. by `mask_coordinates` or coordinate
+        edits). Callers may still assign it directly when they know the
+        sectors (e.g. boundary PacMan tensors).
+        """
+        if self._leg_sectors is None:
+            ls = np.empty(self.n_legs, dtype=object)
+            for i in range(self.n_legs):
+                ls[i] = np.unique(self.coordinates[i, :])
+            self._leg_sectors = ls
+        return self._leg_sectors
+
+    @leg_sectors.setter
+    def leg_sectors(self, value) -> None:
+        self._leg_sectors = value
+
+    def invalidate_leg_sectors(self) -> None:
+        """Mark cached leg_sectors as stale (recomputed on next access)."""
+        self._leg_sectors = None
     
     def _init_from_type(
         self,
@@ -375,8 +401,19 @@ class SymmetricTensor:
             np.unique(self.coordinates[-1, :])
         ], dtype=object)
     
-    def copy(self) -> 'SymmetricTensor':
-        """Create a deep copy of the tensor."""
+    def copy(self, copy_data: bool = True) -> 'SymmetricTensor':
+        """
+        Create a copy of the tensor.
+
+        Parameters
+        ----------
+        copy_data : bool
+            If True (default), deep-copy the data blocks. If False, the
+            data blocks themselves are shared with the original (the object
+            array holding them is still copied). This is safe as long as
+            blocks are only *replaced* (``t.data[i] = ...``), never mutated
+            in place -- which is the convention throughout this library.
+        """
         B = SymmetricTensor(
             self.L, self.d, self.phys_dims,
             alpha=self.alpha,
@@ -386,11 +423,20 @@ class SymmetricTensor:
         )
         B.coordinates = self.coordinates.copy()
         B.data = self.data.copy()
-        for i in range(self.n_sectors):
-            if self.data[i] is not None:
-                B.data[i] = self.data[i].copy()
+        if copy_data:
+            for i in range(self.n_sectors):
+                if self.data[i] is not None:
+                    B.data[i] = self.data[i].copy()
         B.shapes = self.shapes.copy()
-        B.leg_sectors = self.leg_sectors.copy()
+        if self._leg_sectors is None:
+            B._leg_sectors = None
+        else:
+            # Deep-copy the inner arrays: the old shallow copy shared them,
+            # which was fragile (any in-place edit would alias).
+            ls = np.empty(self.n_legs, dtype=object)
+            for i in range(self.n_legs):
+                ls[i] = self._leg_sectors[i].copy()
+            B._leg_sectors = ls
         B.arrows = self.arrows.copy()
         B.leg_type = self.leg_type.copy()
         return B
@@ -425,12 +471,24 @@ def swap_indices(
     tensor.shapes[new_indices, :] = tensor.shapes[old_indices, :]
     tensor.arrows[new_indices] = tensor.arrows[old_indices]
     tensor.leg_type[new_indices] = tensor.leg_type[old_indices]
-    tensor.leg_sectors[new_indices] = tensor.leg_sectors[old_indices]
+    if tensor._leg_sectors is not None:
+        tensor._leg_sectors[new_indices] = tensor._leg_sectors[old_indices]
     
     if tensor.data_as_tensors:
-        for b in range(tensor.n_sectors):
-            if tensor.data[b] is not None:
-                tensor.data[b] = np.moveaxis(tensor.data[b], old_indices, new_indices)
+        # Precompute the transpose permutation once instead of paying
+        # np.moveaxis's axis-normalization overhead for every block.
+        # moveaxis(x, old, new) == transpose(perm) with perm[new] = old
+        # and the remaining axes filling the gaps in original order.
+        perm = np.empty(tensor.n_legs, dtype=np.intp)
+        perm[new_indices] = old_indices
+        rest_dst = np.setdiff1d(np.arange(tensor.n_legs), new_indices)
+        rest_src = np.setdiff1d(np.arange(tensor.n_legs), old_indices)
+        perm[rest_dst] = rest_src
+        perm_t = tuple(int(p) for p in perm)
+        if perm_t != tuple(range(tensor.n_legs)):
+            for b in range(tensor.n_sectors):
+                if tensor.data[b] is not None:
+                    tensor.data[b] = tensor.data[b].transpose(perm_t)
     
     return tensor
 
@@ -458,8 +516,6 @@ def mask_coordinates(
     tensor.data = tensor.data[mask]
     tensor.shapes = tensor.shapes[:, mask]
     tensor.n_sectors = np.sum(mask)
-    tensor.leg_sectors = np.array([
-        np.unique(tensor.coordinates[i, :])
-        for i in range(tensor.n_legs)
-    ], dtype=object)
+    # Lazy: recomputed from coordinates on next access.
+    tensor.invalidate_leg_sectors()
     return tensor
