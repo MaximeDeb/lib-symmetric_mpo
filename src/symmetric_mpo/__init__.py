@@ -78,7 +78,7 @@ from .linalg import (
     tensor_contract,
     trace_mpo_product,
     site_pacman,
-    compute_R_matrix,
+    compute_obdmo,
     compute_otoc,
 )
 
@@ -124,7 +124,7 @@ __all__ = [
     "tensor_contract",
     "trace_mpo_product",
     "site_pacman",
-    "compute_R_matrix",
+    "compute_obdmo",
     "compute_otoc",
     # TEBD
     "apply_gate",

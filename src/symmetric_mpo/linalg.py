@@ -593,7 +593,7 @@ def site_pacman(
     return L_PM, R_PM
 
 
-def compute_R_matrix(
+def compute_obdmo(
     mpo: 'SymmetricMPO',
     unitary: bool = False,
     optimized: bool = True
