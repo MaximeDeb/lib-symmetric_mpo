@@ -743,13 +743,23 @@ def _propagate_sectors_forward(
     expanded = current.copy()
     deg_exp = degen.copy()
     
-    for _ in range(2 * phys_dims):
-        expanded = expanded[:, None] + loc_sig[None, :]
+    # For alpha=L+1 the bond charge is flat-encoded as u = l*(L+1) + l':
+    # the first phys_dims legs (sigma) increment l, so they add
+    # sigma*(L+1); the last phys_dims legs (sigma') increment l' and add
+    # sigma. (Previously all legs added sigma, so under the diagonal
+    # l = l' constraint only the vacuum chain survived and the sector
+    # projector was empty for any q_alpha > 0.)
+    for leg in range(2 * phys_dims):
+        if alpha == L + 1 and leg < phys_dims:
+            inc = loc_sig * (L + 1)
+        else:
+            inc = loc_sig
+        expanded = expanded[:, None] + inc[None, :]
         expanded = expanded.ravel()
         deg_exp = np.repeat(deg_exp, len(loc_sig))
     
     # For alpha=-1: l_R = l_L + sigma - sigma'
-    # For alpha=L+1: more complex
+    # For alpha=L+1: l_R = l_L + sigma, l'_R = l'_L + sigma'
     if alpha == -1:
         # Apply constraints
         mask = expanded >= 0
@@ -799,8 +809,14 @@ def _propagate_sectors_backward(
     expanded = current.copy()
     deg_exp = degen.copy()
     
-    for _ in range(2 * phys_dims):
-        expanded = expanded[:, None] - loc_sig[None, :]
+    # Same flat-encoding weighting as in the forward pass (see there):
+    # for alpha=L+1 the sigma legs act on l and carry a factor (L+1).
+    for leg in range(2 * phys_dims):
+        if alpha == L + 1 and leg < phys_dims:
+            inc = loc_sig * (L + 1)
+        else:
+            inc = loc_sig
+        expanded = expanded[:, None] - inc[None, :]
         expanded = expanded.ravel()
         deg_exp = np.repeat(deg_exp, len(loc_sig))
     
@@ -885,18 +901,33 @@ def apply_fermionic_op(
     B.invalidate_leg_sectors()
     
     # Propagate charge change to sites on the right
+    if op_type == "c":
+        delta = -1 if side == "L" else O.alpha
+    else:  # "c+"
+        delta = 1 if side == "L" else -O.alpha
+    
     for j in range(site + 1, O.L):
         Bj = O.TN[f"B{j}"]
-        if op_type == "c":
-            Bj.coordinates[0, :] += -1 if side == "L" else O.alpha
-        elif op_type == "c+":
-            Bj.coordinates[0, :] += 1 if side == "L" else -O.alpha
+        Bj.coordinates[0, :] += delta
         Bj.coordinates[-1, :] = (
             Bj.coordinates[0, :] + 
             O.alpha * Bj.coordinates[1, :] + 
             Bj.coordinates[2, :]
         )
         Bj.invalidate_leg_sectors()
+        
+        # Keep the Vidal form self-consistent: the Lambda on the bond to
+        # the left of site j carries the same sector labels as B_j's left
+        # leg, so its keys must shift by the same amount. (Previously the
+        # Lambdas kept their STALE labels; any subsequent apply_gate then
+        # found no overlap between Lambda sectors and tensor sectors,
+        # which fed the apply_lambda corruption path.)
+        lam = O.TN[f"Lam{j}"]
+        lam.data = {k + delta: v for k, v in lam.data.items()}
+        if len(lam.left_sectors):
+            lam.left_sectors = lam.left_sectors + delta
+        if len(lam.right_sectors):
+            lam.right_sectors = lam.right_sectors + delta
     
     # Jordan-Wigner string (in place: O is already our private copy)
     sign_sites = np.arange(site) if sign_side == "L" else np.arange(site + 1, O.L)

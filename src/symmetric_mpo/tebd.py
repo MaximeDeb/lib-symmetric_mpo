@@ -47,7 +47,15 @@ def apply_gate(
     both_sides : bool
         If True, apply gate from left and gate_dag from right.
     side : {"L", "R"}
-        Which side to apply when both_sides=False and right_gate=None.        
+        Which side to apply when both_sides=False and right_gate=None.
+        WARNING: the side="R" branch is faithfully preserved from the
+        original code but appears to have never worked: the plain gate's
+        leg_type ('s') is contracted against the primed physical legs,
+        which mislabels the conserved charge. From the identity it
+        silently produces a norm-collapsed operator, and once the bond
+        dimension exceeds 1 it raises a shape mismatch. Verify against a
+        dense reference before relying on it (right multiplication can
+        instead be obtained as (U_dag O_dag)_dag via side="L").
     Returns
     -------
     mpo : SymmetricMPO

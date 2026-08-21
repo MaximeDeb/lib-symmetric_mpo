@@ -315,15 +315,17 @@ class SymmetricTensor:
         maskp = np.isin(conn_lp, R_sect[1]).reshape(conn_lp.shape)
         
         # Combine masks
+        # (Index must be built by tuple concatenation: `mask[..., (None,)*k]`
+        # nests a tuple inside the index and raises IndexError.)
         allowed = (
-            mask[..., (None,) * phys_dims] * 
+            mask[(...,) + (None,) * phys_dims] * 
             maskp[(slice(None),) + (None,) * phys_dims + (...,)]
         )
         
         # For identity-like operators, require l = l'
         if initial in ("Id",) or (initial and initial[0] == "S"):
             allowed = allowed * (
-                conn_l[..., (None,) * phys_dims] == 
+                conn_l[(...,) + (None,) * phys_dims] == 
                 conn_lp[(slice(None),) + (None,) * phys_dims + (...,)]
             )
         
